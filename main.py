@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
-"""One Strawberry - a single ripe strawberry, drawn procedurally in pure Python.
+"""One Strawberry -- a single ripe strawberry, procedurally drawn.
 
-Standard library only. Fully deterministic: no clock, no randomness, no
-network. Writes a 1024x1024 PNG (own encoder) to /output/entry.png when
-/output exists, otherwise ./entry.png in the current directory.
+Pure Python, standard library only: no PIL, no network, no clock,
+no unseeded randomness. Fully deterministic -- running this script
+twice produces a byte-identical PNG.
+
+Canvas: 1024x1024 RGB. One ingredient, one look, one taste.
 """
 
 import math
@@ -11,230 +12,286 @@ import os
 import struct
 import zlib
 
-W = 1024
-H = 1024
-
-buf = bytearray(W * H * 3)
-mask = bytearray(W * H)  # 1 where the berry body is
+W, H = 1024, 1024
 
 
-def set_px(x, y, r, g, b):
-    i = (y * W + x) * 3
-    buf[i] = r
-    buf[i + 1] = g
-    buf[i + 2] = b
+def clamp(v, lo=0, hi=255):
+    return lo if v < lo else hi if v > hi else v
 
 
-def blend_px(x, y, r, g, b, a):
-    i = (y * W + x) * 3
-    ia = 1.0 - a
-    buf[i] = int(buf[i] * ia + r * a + 0.5)
-    buf[i + 1] = int(buf[i + 1] * ia + g * a + 0.5)
-    buf[i + 2] = int(buf[i + 2] * ia + b * a + 0.5)
+def clampf(v, lo=0.0, hi=1.0):
+    return lo if v < lo else hi if v > hi else v
 
 
-def clamp255(v):
-    if v < 0:
-        return 0
-    if v > 255:
-        return 255
-    return int(v)
+def smoothstep(a, b, x):
+    """Smooth 0->1 ramp between a and b."""
+    if x <= a:
+        return 0.0
+    if x >= b:
+        return 1.0
+    t = (x - a) / (b - a)
+    return t * t * (3.0 - 2.0 * t)
 
 
-# ---------------------------------------------------------------- background
-def draw_background():
-    for y in range(H):
-        dy = y - 470
-        row = y * W
-        for x in range(W):
-            dx = x - 512
-            d = math.sqrt(dx * dx + dy * dy) / 780.0
-            if d > 1.0:
-                d = 1.0
-            s = d * d * (3.0 - 2.0 * d)  # smoothstep falloff
-            i = (row + x) * 3
-            buf[i] = int(255 + (236 - 255) * s + 0.5)
-            buf[i + 1] = int(251 + (212 - 251) * s + 0.5)
-            buf[i + 2] = int(242 + (176 - 242) * s + 0.5)
+def lerp(a, b, t):
+    return a + (b - a) * t
 
 
-# ---------------------------------------------------------------- soft shadow
-def draw_shadow():
-    for y in range(905 - 48, 905 + 49):
-        dy = (y - 905) / 48.0
-        for x in range(512 - 310, 512 + 311):
-            dx = (x - 512) / 310.0
-            q = dx * dx + dy * dy
-            if q < 1.0:
-                blend_px(x, y, 96, 52, 32, 0.28 * (1.0 - q))
+def lerp_color(c1, c2, t):
+    t = clampf(t)
+    return (
+        int(lerp(c1[0], c2[0], t)),
+        int(lerp(c1[1], c2[1], t)),
+        int(lerp(c1[2], c2[2], t)),
+    )
 
 
-# ---------------------------------------------------------------- berry shape
-# Smooth analytic width profile: broad shoulders, tapering to a point.
-# One C-infinite curve (no control-point knots), so the silhouette reads
-# as a single clean outline. Matches the old profile's shape:
-#   w(0)=0.55, peak 1.00 near t=0.22, 0.92 @ 0.45, ~0.78 @ 0.65,
-#   ~0.47 @ 0.85, ~0.17 @ 0.97, 0.00 @ 1.00.
-def half_width(t):
-    # shoulders ramp in over t in [0, 0.22] (smoothstep)
-    s = t / 0.22
-    if s > 1.0:
-        s = 1.0
-    s = s * s * (3.0 - 2.0 * s)
-    taper = (1.0 - t ** 2.8) ** 0.72
-    return (0.55 + 0.45 * s) * taper * 290.0
+def blend(dst, src, alpha):
+    """Alpha-blend src over dst; alpha in [0, 1]."""
+    a = clampf(alpha)
+    return (
+        int(src[0] * a + dst[0] * (1.0 - a)),
+        int(src[1] * a + dst[1] * (1.0 - a)),
+        int(src[2] * a + dst[2] * (1.0 - a)),
+    )
 
 
-# Top edge dips at the centre where the calyx sits (depends on x only).
-TOP_Y = {}
-for _x in range(202, 823):
-    TOP_Y[_x] = 250.0 + 48.0 * math.exp(-(((_x - 512) / 120.0) ** 2))
+class Canvas:
+    """Simple RGB pixel buffer with primitive ellipse/point drawing."""
 
+    def __init__(self, w, h, fill):
+        self.w = w
+        self.h = h
+        self.px = bytearray(w * h * 3)
+        r, g, b = fill
+        for i in range(0, len(self.px), 3):
+            self.px[i] = r
+            self.px[i + 1] = g
+            self.px[i + 2] = b
 
-def draw_body():
-    for y in range(250, 891):
-        t = (y - 250) / 640.0
-        hw = half_width(t)
-        if hw <= 0.0:
-            continue
-        x0 = int(math.ceil(512 - hw))
-        x1 = int(math.floor(512 + hw))
-        for x in range(x0, x1 + 1):
-            if y < TOP_Y[x]:
-                continue
-            # --- base colour: highlight -> mid red -> deep red
-            u = ((x - 400) / 360.0) ** 2 + ((y - 420) / 400.0) ** 2
-            if u > 1.0:
-                u = 1.0
-            w = u * 1.5
-            if w > 1.0:
-                w = 1.0
-            r = 255.0 + (231.0 - 255.0) * w
-            g = 112.0 + (32.0 - 112.0) * w
-            b = 90.0 + (40.0 - 90.0) * w
-            deep = 0.45 * t + 0.6 * max(0.0, u - 0.55) / 0.45
-            if deep > 0.75:
-                deep = 0.75
-            r += (150.0 - r) * deep
-            g += (12.0 - g) * deep
-            b += (28.0 - b) * deep
-            # --- darken the rim
-            rr = abs(x - 512) / hw
-            if rr > 0.82:
-                s = 1.0 - 0.25 * (rr - 0.82) / 0.18
-                r *= s
-                g *= s
-                b *= s
-            # --- faint deterministic mottling
-            m = (x * 31 + y * 17) % 13 - 6
-            r += m
-            g += m // 2
-            b += m // 2
-            i = (y * W + x) * 3
-            buf[i] = clamp255(r)
-            buf[i + 1] = clamp255(g)
-            buf[i + 2] = clamp255(b)
-            mask[y * W + x] = 1
+    def set(self, x, y, color):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            i = (y * self.w + x) * 3
+            self.px[i] = color[0]
+            self.px[i + 1] = color[1]
+            self.px[i + 2] = color[2]
 
+    def get(self, x, y):
+        i = (y * self.w + x) * 3
+        return (self.px[i], self.px[i + 1], self.px[i + 2])
 
-# ---------------------------------------------------------------- helpers
-def ellipse(cx, cy, rx, ry, r, g, b, a=1.0, shear=0.0, only_mask=False):
-    x0 = int(math.floor(cx - rx)) - 1
-    x1 = int(math.ceil(cx + rx)) + 1
-    y0 = int(math.floor(cy - ry)) - 1
-    y1 = int(math.ceil(cy + ry)) + 1
-    for y in range(max(0, y0), min(H, y1 + 1)):
-        for x in range(max(0, x0), min(W, x1 + 1)):
-            if only_mask and not mask[y * W + x]:
-                continue
-            dx = x - cx
-            dy = y - cy - shear * dx
-            q = (dx / rx) ** 2 + (dy / ry) ** 2
-            if q <= 1.0:
-                if a >= 1.0:
-                    set_px(x, y, r, g, b)
-                else:
-                    blend_px(x, y, r, g, b, a)
+    def blend(self, x, y, color, alpha):
+        if 0 <= x < self.w and 0 <= y < self.h and alpha > 0.0:
+            self.set(x, y, blend(self.get(x, y), color, alpha))
 
-
-def radial_glow(cx, cy, rx, ry, r, g, b, a_max, only_mask=True):
-    x0 = int(math.floor(cx - rx)) - 1
-    x1 = int(math.ceil(cx + rx)) + 1
-    y0 = int(math.floor(cy - ry)) - 1
-    y1 = int(math.ceil(cy + ry)) + 1
-    for y in range(max(0, y0), min(H, y1 + 1)):
-        for x in range(max(0, x0), min(W, x1 + 1)):
-            if only_mask and not mask[y * W + x]:
-                continue
-            dx = (x - cx) / rx
+    def fill_ellipse(self, cx, cy, rx, ry, color, alpha=1.0, shear=0.0):
+        """Fill an ellipse (optionally sheared in x by y) with flat alpha."""
+        x0 = max(0, int(cx - rx - abs(shear) * ry - 2))
+        x1 = min(self.w - 1, int(cx + rx + abs(shear) * ry + 2))
+        y0 = max(0, int(cy - ry - 2))
+        y1 = min(self.h - 1, int(cy + ry + 2))
+        for y in range(y0, y1 + 1):
             dy = (y - cy) / ry
-            q = dx * dx + dy * dy
-            if q < 1.0:
-                blend_px(x, y, r, g, b, a_max * (1.0 - math.sqrt(q)))
+            if dy * dy > 1.0:
+                continue
+            half = rx * math.sqrt(1.0 - dy * dy)
+            shift = shear * (y - cy)
+            xa = int(cx + shift - half)
+            xb = int(cx + shift + half)
+            if xa < x0:
+                xa = x0
+            if xb > x1:
+                xb = x1
+            for x in range(xa, xb + 1):
+                self.blend(x, y, color, alpha)
+
+    def radial_ellipse(self, cx, cy, rx, ry, color, alpha, shear=0.0):
+        """Ellipse filled with a radial alpha falloff to 0 at the rim."""
+        x0 = max(0, int(cx - rx - abs(shear) * ry - 2))
+        x1 = min(self.w - 1, int(cx + rx + abs(shear) * ry + 2))
+        y0 = max(0, int(cy - ry - 2))
+        y1 = min(self.h - 1, int(cy + ry + 2))
+        for y in range(y0, y1 + 1):
+            dy = (y - cy) / ry
+            for x in range(x0, x1 + 1):
+                dx = (x - cx - shear * (y - cy)) / rx
+                d2 = dx * dx + dy * dy
+                if d2 > 1.0:
+                    continue
+                a = alpha * (1.0 - math.sqrt(d2))
+                self.blend(x, y, color, a)
+
+    def draw_line(self, x0, y0, x1, y1, color, alpha=1.0, width=1):
+        """Simple DDA line, width in pixels (square brush)."""
+        steps = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+        half = width // 2
+        for i in range(steps + 1):
+            t = i / steps if steps else 0.0
+            x = int(round(x0 + (x1 - x0) * t))
+            y = int(round(y0 + (y1 - y0) * t))
+            for dy in range(-half, half + 1):
+                for dx in range(-half, half + 1):
+                    self.blend(x + dx, y + dy, color, alpha)
+
+    def fill_polygon(self, points, color, alpha=1.0):
+        """Scanline polygon fill (even-odd via scanline intersections)."""
+        ys = [p[1] for p in points]
+        y0 = max(0, int(min(ys)))
+        y1 = min(self.h - 1, int(max(ys)) + 1)
+        n = len(points)
+        for y in range(y0, y1 + 1):
+            xs = []
+            for i in range(n):
+                x_a, y_a = points[i]
+                x_b, y_b = points[(i + 1) % n]
+                if (y_a <= y < y_b) or (y_b <= y < y_a):
+                    t = (y - y_a) / (y_b - y_a)
+                    xs.append(x_a + t * (x_b - x_a))
+            xs.sort()
+            for k in range(0, len(xs) - 1, 2):
+                xa = max(0, int(math.ceil(xs[k])))
+                xb = min(self.w - 1, int(math.floor(xs[k + 1])))
+                for x in range(xa, xb + 1):
+                    self.blend(x, y, color, alpha)
 
 
-def fill_poly(pts, r, g, b):
-    ys = [p[1] for p in pts]
-    y0 = int(min(ys))
-    y1 = int(max(ys))
-    n = len(pts)
-    for y in range(max(0, y0), min(H, y1 + 1)):
-        xs = []
-        for i in range(n):
-            x1, y1p = pts[i]
-            x2, y2p = pts[(i + 1) % n]
-            if (y1p <= y < y2p) or (y2p <= y < y1p):
-                xs.append(x1 + (y - y1p) * (x2 - x1) / (y2p - y1p))
-        xs.sort()
-        for k in range(0, len(xs) - 1, 2):
-            for x in range(int(math.ceil(xs[k])), int(math.floor(xs[k + 1])) + 1):
-                if 0 <= x < W:
-                    set_px(x, y, r, g, b)
+# ---------------------------------------------------------------- PNG
+
+def _chunk(kind, data):
+    out = struct.pack(">I", len(data))
+    out += kind
+    out += data
+    out += struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return out
 
 
-def thick_line(x0, y0, x1, y1, w, r, g, b):
-    steps = int(max(abs(x1 - x0), abs(y1 - y0))) * 2 + 1
-    rr = w / 2.0
-    for s in range(steps + 1):
-        f = s / steps
-        cx = x0 + (x1 - x0) * f
-        cy = y0 + (y1 - y0) * f
-        for yy in range(int(cy - rr) - 1, int(cy + rr) + 2):
-            for xx in range(int(cx - rr) - 1, int(cx + rr) + 2):
-                if (xx - cx) ** 2 + (yy - cy) ** 2 <= rr * rr:
-                    if 0 <= xx < W and 0 <= yy < H:
-                        set_px(xx, yy, r, g, b)
+def write_png(canvas, path):
+    raw = bytearray()
+    for y in range(canvas.h):
+        raw.append(0)  # filter: none
+        raw.extend(canvas.px[y * canvas.w * 3:(y + 1) * canvas.w * 3])
+    ihdr = struct.pack(">IIBBBBB", canvas.w, canvas.h, 8, 2, 0, 0, 0)
+    data = b"\x89PNG\r\n\x1a\n"
+    data += _chunk(b"IHDR", ihdr)
+    data += _chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    data += _chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(data)
+    return len(data)
 
 
-# ---------------------------------------------------------------- seeds
-def draw_seeds():
-    for row in range(10):
-        t = 0.16 + row * 0.08
-        y = 250 + t * 640
-        hw = half_width(t)
-        limit = 0.85 * hw
-        off = 27.0 if row % 2 else 0.0
-        base = 512.0 + off
-        n0 = math.ceil((512.0 - limit - base) / 54.0)
-        x = base + n0 * 54.0
-        while x <= 512.0 + limit:
-            shear = 0.35 * (x - 512.0) / 290.0
-            # dark-red dimple, shifted down 3px
-            ellipse(x, y + 3, 8, 12, 120, 10, 20, a=0.45, shear=shear,
-                    only_mask=True)
-            # pale gold seed
-            ellipse(x, y, 5.5, 9, 255, 224, 138, shear=shear, only_mask=True)
-            # tiny bright speck near its top-left
-            ellipse(x - 2, y - 4, 1.8, 1.2, 255, 250, 220, a=0.95,
-                    only_mask=True)
-            x += 54.0
+# ------------------------------------------------------- background
+
+def draw_background(cv):
+    cx, cy, r = 512.0, 470.0, 780.0
+    inner = (255, 251, 242)
+    outer = (236, 212, 176)
+    for y in range(H):
+        for x in range(W):
+            d = math.sqrt((x - cx) ** 2 + (y - cy) ** 2) / r
+            d = clampf(d)
+            t = d * d * (3.0 - 2.0 * d)  # smooth falloff
+            cv.set(x, y, lerp_color(inner, outer, t))
 
 
-# ---------------------------------------------------------------- gloss + dew
-def draw_gloss():
-    radial_glow(415, 430, 150, 110, 255, 255, 255, 0.13)
-    radial_glow(455, 395, 62, 42, 255, 255, 255, 0.10)
+def draw_shadow(cv):
+    # Soft ellipse under the berry, alpha peaking at 0.28 in the centre.
+    cv.radial_ellipse(512, 905, 310, 48, (96, 52, 32), 0.28)
 
+
+# ------------------------------------------------------- berry shape
+
+TOP_Y = 250.0
+TIP_Y = 890.0
+CENTER_X = 512.0
+MAX_HW = 290.0
+
+
+def half_width(t):
+    """Half-width fraction at depth t in [0, 1] along the berry."""
+    ramp = smoothstep(0.0, 0.22, t)
+    taper = (1.0 - t ** 2.8) ** 0.72 if t < 1.0 else 0.0
+    return ramp * taper
+
+
+def top_edge_y(x):
+    """Top edge dips at the centre where the calyx sits."""
+    return TOP_Y + 48.0 * math.exp(-((x - CENTER_X) / 120.0) ** 2)
+
+
+def berry_colour(x, y, t, hw):
+    """Red gradient: bright gloss near (400,420), deep red at depth/rim."""
+    u = ((x - 400.0) / 360.0) ** 2 + ((y - 420.0) / 400.0) ** 2
+    u = clampf(u)
+    c = lerp_color((255, 112, 90), (231, 32, 40), clampf(u * 1.5))
+    deep = clampf((t * 0.9 + max(0.0, u - 0.55) * 1.4) * 0.85, 0.0, 0.75)
+    c = lerp_color(c, (150, 12, 28), deep)
+    # Darken the rim.
+    rim = abs(x - CENTER_X) / hw if hw > 0 else 0.0
+    if rim > 0.82:
+        scale = 1.0 - 0.25 * ((rim - 0.82) / 0.18)
+        c = (int(c[0] * scale), int(c[1] * scale), int(c[2] * scale))
+    # Faint deterministic mottling.
+    m = (x * 31 + y * 17) % 13 - 6
+    return (
+        clamp(c[0] + m),
+        clamp(c[1] + m // 2),
+        clamp(c[2] + m // 2),
+    )
+
+
+def draw_berry(cv):
+    for y in range(int(TOP_Y), int(TIP_Y) + 1):
+        t = (y - TOP_Y) / (TIP_Y - TOP_Y)
+        hw = MAX_HW * half_width(t)
+        if hw <= 0.5:
+            continue
+        x0 = int(CENTER_X - hw)
+        x1 = int(CENTER_X + hw)
+        top = top_edge_y(CENTER_X)  # dip is per-x; checked below
+        for x in range(x0, x1 + 1):
+            if y < top_edge_y(x):
+                continue
+            cv.set(x, y, berry_colour(x, y, t, hw))
+
+
+# ------------------------------------------------------- gloss
+
+def draw_gloss(cv):
+    cv.radial_ellipse(415, 430, 150, 110, (255, 255, 255), 0.13)
+    cv.radial_ellipse(455, 395, 62, 42, (255, 255, 255), 0.10)
+
+
+# ------------------------------------------------------- seeds
+
+def draw_seeds(cv):
+    t = 0.16
+    row = 0
+    while t <= 0.881:
+        y = int(TOP_Y + t * (TIP_Y - TOP_Y))
+        hw = MAX_HW * half_width(t)
+        if hw > 20:
+            offset = 27.0 if row % 2 else 0.0
+            x = CENTER_X - 0.85 * hw + offset
+            # Start a touch inside the left edge so seeds sit on the body.
+            while x < CENTER_X + 0.85 * hw:
+                if abs(x - CENTER_X) < 0.85 * hw:
+                    shear = (x - CENTER_X) / hw * 0.18
+                    # Translucent dark-red dimple, shifted down 3px.
+                    cv.fill_ellipse(x, y + 3, 8, 12, (120, 10, 22),
+                                    alpha=0.45, shear=shear)
+                    # Pale gold seed.
+                    cv.fill_ellipse(x, y, 5.5, 9, (255, 224, 138),
+                                    shear=shear)
+                    # Tiny bright speck near the top-left of the seed.
+                    cv.fill_ellipse(x - 2, y - 4, 1.6, 2.2,
+                                    (255, 246, 200), shear=shear)
+                x += 54.0
+        t += 0.08
+        row += 1
+
+
+# ------------------------------------------------------- droplets
 
 DROPLETS = [
     (430, 480, 14), (600, 520, 11), (480, 650, 16), (620, 700, 9),
@@ -242,15 +299,17 @@ DROPLETS = [
 ]
 
 
-def draw_droplets():
-    for cx, cy, r in DROPLETS:
-        radial_glow(cx, cy, r, r, 235, 245, 255, 0.6)
-        ellipse(cx - r * 0.35, cy - r * 0.4, max(1.5, r * 0.25),
-                max(1.5, r * 0.25), 255, 255, 255, a=0.9, only_mask=True)
+def draw_droplets(cv):
+    for (x, y, r) in DROPLETS:
+        cv.radial_ellipse(x, y, r, r, (235, 245, 255), 0.55)
+        cv.fill_ellipse(x - r * 0.35, y - r * 0.35, r * 0.22, r * 0.22,
+                        (255, 255, 255), alpha=0.9)
 
 
-# ---------------------------------------------------------------- calyx + stem
-LEAVES = [  # (angle deg from vertical, length, colour)
+# ------------------------------------------------------- calyx & stem
+
+LEAVES = [
+    # (angle deg from vertical, length, colour)
     (-72, 150, (74, 122, 52)),
     (-45, 168, (92, 146, 62)),
     (-20, 175, (62, 108, 44)),
@@ -260,62 +319,58 @@ LEAVES = [  # (angle deg from vertical, length, colour)
 ]
 
 
-def draw_calyx_stem():
-    # six pointed leaves fanning from (512, 292)
-    bx, by = 512.0, 292.0
-    for ang, length, col in LEAVES:
-        a = math.radians(ang)
-        dx, dy = math.sin(a), -math.cos(a)      # leaf direction
-        px, py = math.cos(a), math.sin(a)       # perpendicular
-        tip = (bx + dx * length, by + dy * length)
-        mid = (bx + dx * length * 0.45, by + dy * length * 0.45)
-        bl = (bx - px * 20, by - py * 20)
-        ml = (mid[0] - px * 34, mid[1] - py * 34)
-        mr = (mid[0] + px * 34, mid[1] + py * 34)
-        br = (bx + px * 20, by + py * 20)
-        fill_poly([bl, ml, tip, mr, br], col[0], col[1], col[2])
-        dark = (int(col[0] * 0.55), int(col[1] * 0.55), int(col[2] * 0.55))
-        thick_line(bx, by, tip[0], tip[1], 2, dark[0], dark[1], dark[2])
-    # centre cap
-    ellipse(512, 292, 30, 22, 58, 104, 42)
-    # stem LAST, in front of the leaves: tapered, slightly tilted right,
-    # rising from the calyx centre to y=150 so it peeks above the leaves
-    fill_poly([(505, 298), (519, 298), (530, 152), (520, 148)], 104, 110, 58)
-    thick_line(512, 292, 525, 150, 3, 140, 148, 84)
+def _leaf_points(cx, cy, angle_deg, length):
+    """Five-point tapered leaf: base-left, mid-left bulge, tip,
+    mid-right bulge, base-right. Angle measured from vertical."""
+    a = math.radians(angle_deg)
+    dx, dy = math.sin(a), -math.cos(a)  # tip direction (up is -y)
+    px, py = math.cos(a), math.sin(a)   # perpendicular
+    bx, by = cx, cy
+    tx, ty = cx + dx * length, cy + dy * length
+    half = 20.0
+    mid = 0.45
+    mx, my = cx + dx * length * mid, cy + dy * length * mid
+    bulge = 26.0
+    return [
+        (bx - px * half, by - py * half),
+        (mx - px * bulge, my - py * bulge),
+        (tx, ty),
+        (mx + px * bulge, my + py * bulge),
+        (bx + px * half, by + py * half),
+    ]
 
 
-# ---------------------------------------------------------------- PNG encoder
-def _chunk(typ, data):
-    out = struct.pack(">I", len(data)) + typ + data
-    out += struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
-    return out
+def draw_calyx(cv):
+    cx, cy = 512.0, 292.0
+    for angle, length, colour in LEAVES:
+        pts = _leaf_points(cx, cy, angle, length)
+        cv.fill_polygon(pts, colour)
+        # Darker centre vein from base to tip.
+        a = math.radians(angle)
+        tx, ty = cx + math.sin(a) * length * 0.92, cy - math.cos(a) * length * 0.92
+        dark = (max(0, colour[0] - 28), max(0, colour[1] - 30),
+                max(0, colour[2] - 24))
+        cv.draw_line(int(cx), int(cy), int(tx), int(ty), dark, width=2)
+    # Centre cap over the leaf bases.
+    cv.fill_ellipse(512, 292, 30, 22, (58, 104, 42))
+    # Stem, drawn last so it peeks above the leaves.
+    cv.draw_line(512, 292, 528, 150, (104, 110, 58), width=7)
+    cv.draw_line(515, 285, 528, 155, (140, 146, 88), width=2)
 
 
-def write_png(path):
-    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
-    raw = bytearray()
-    for y in range(H):
-        raw.append(0)
-        raw += buf[y * W * 3:(y + 1) * W * 3]
-    png = (b"\x89PNG\r\n\x1a\n"
-           + _chunk(b"IHDR", ihdr)
-           + _chunk(b"IDAT", zlib.compress(bytes(raw), 6))
-           + _chunk(b"IEND", b""))
-    with open(path, "wb") as f:
-        f.write(png)
-    return len(png)
-
+# ------------------------------------------------------- entry point
 
 def main():
-    draw_background()
-    draw_shadow()
-    draw_body()
-    draw_seeds()
-    draw_gloss()
-    draw_droplets()
-    draw_calyx_stem()
-    out = "/output/entry.png" if os.path.isdir("/output") else "./entry.png"
-    n = write_png(out)
+    cv = Canvas(W, H, (255, 251, 242))
+    draw_background(cv)
+    draw_shadow(cv)
+    draw_berry(cv)
+    draw_gloss(cv)
+    draw_seeds(cv)
+    draw_droplets(cv)
+    draw_calyx(cv)
+    out = "/output/entry.png" if os.path.isdir("/output") else "entry.png"
+    n = write_png(cv, out)
     print(f"wrote {out} ({n} bytes)")
 
 

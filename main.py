@@ -70,21 +70,19 @@ def draw_shadow():
 
 
 # ---------------------------------------------------------------- berry shape
-PROFILE = [
-    (0.00, 0.55), (0.08, 0.88), (0.22, 1.00), (0.45, 0.92),
-    (0.65, 0.74), (0.85, 0.45), (0.97, 0.16), (1.00, 0.00),
-]
-
-
+# Smooth analytic width profile: broad shoulders, tapering to a point.
+# One C-infinite curve (no control-point knots), so the silhouette reads
+# as a single clean outline. Matches the old profile's shape:
+#   w(0)=0.55, peak 1.00 near t=0.22, 0.92 @ 0.45, ~0.78 @ 0.65,
+#   ~0.47 @ 0.85, ~0.17 @ 0.97, 0.00 @ 1.00.
 def half_width(t):
-    for i in range(len(PROFILE) - 1):
-        t0, w0 = PROFILE[i]
-        t1, w1 = PROFILE[i + 1]
-        if t0 <= t <= t1:
-            mu = (t - t0) / (t1 - t0)
-            mu = (1.0 - math.cos(math.pi * mu)) / 2.0  # cosine interpolation
-            return (w0 + (w1 - w0) * mu) * 290.0
-    return 0.0
+    # shoulders ramp in over t in [0, 0.22] (smoothstep)
+    s = t / 0.22
+    if s > 1.0:
+        s = 1.0
+    s = s * s * (3.0 - 2.0 * s)
+    taper = (1.0 - t ** 2.8) ** 0.72
+    return (0.55 + 0.45 * s) * taper * 290.0
 
 
 # Top edge dips at the centre where the calyx sits (depends on x only).
@@ -263,9 +261,6 @@ LEAVES = [  # (angle deg from vertical, length, colour)
 
 
 def draw_calyx_stem():
-    # stem: tapered polygon up from the berry
-    fill_poly([(505, 298), (519, 298), (521, 196), (511, 192)], 104, 110, 58)
-    thick_line(512, 292, 516, 194, 3, 140, 148, 84)
     # six pointed leaves fanning from (512, 292)
     bx, by = 512.0, 292.0
     for ang, length, col in LEAVES:
@@ -283,6 +278,10 @@ def draw_calyx_stem():
         thick_line(bx, by, tip[0], tip[1], 2, dark[0], dark[1], dark[2])
     # centre cap
     ellipse(512, 292, 30, 22, 58, 104, 42)
+    # stem LAST, in front of the leaves: tapered, slightly tilted right,
+    # rising from the calyx centre to y=150 so it peeks above the leaves
+    fill_poly([(505, 298), (519, 298), (530, 152), (520, 148)], 104, 110, 58)
+    thick_line(512, 292, 525, 150, 3, 140, 148, 84)
 
 
 # ---------------------------------------------------------------- PNG encoder
